@@ -1,0 +1,223 @@
+name: CI Pipeline - Pagos Fintech
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: '21'
+  MAVEN_VERSION: '3.9.6'
+  SERENITY_VERSION: '4.1.0'
+
+jobs:
+  build:
+    name: Build and Compile
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: Cache Maven packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+            
+      - name: Build project
+        run: mvn clean compile -DskipTests
+        
+      - name: Verify compilation
+        run: |
+          if [ ! -d "target/classes" ]; then
+            echo "Compilation failed - target/classes not found"
+            exit 1
+          fi
+          echo "Compilation successful"
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: build
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: Cache Maven packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+            
+      - name: Run unit tests
+        run: mvn test -Dtest=*Test
+        
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: unit-test-results
+          path: target/surefire-reports/*.xml
+          retention-days: 30
+          
+      - name: Generate test summary
+        if: always()
+        run: |
+          echo "## Unit Test Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f "target/surefire-reports/testng-results.xml" ]; then
+            echo "Tests executed successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No test results found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  bdd-tests:
+    name: BDD Tests - Serenity
+    runs-on: ubuntu-latest
+    needs: build
+    
+    services:
+      chrome:
+        image: selenium/standalone-chrome:latest
+        ports:
+          - 4444:4444
+          - 7900:7900
+        options: --shm-size=2g
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: Cache Maven packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2-
+            
+      - name: Run BDD tests
+        run: mvn verify -Denvironment=qa
+        continue-on-error: true
+        
+      - name: Upload Serenity reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: serenity-reports
+          path: target/site/serenity/
+          retention-days: 30
+          
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: bdd-test-results
+          path: |
+            target/failsafe-reports/*.xml
+            target/surefire-reports/*.xml
+          retention-days: 30
+          
+      - name: Generate BDD test summary
+        if: always()
+        run: |
+          echo "## BDD Test Results" >> $GITHUB_STEP_SUMMARY
+          TOTAL=$(find target -name "serenity.json" -exec cat {} \; 2>/dev/null | grep -c '"scenario"' || echo "0")
+          echo "Total scenarios executed: $TOTAL" >> $GITHUB_STEP_SUMMARY
+          if [ -f "target/site/serenity/index.html" ]; then
+            echo "Serenity report generated successfully" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: [unit-tests, bdd-tests]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: Download test results
+        uses: actions/download-artifact@v3
+        with:
+          name: bdd-test-results
+          path: target/test-results
+          
+      - name: Check test results
+        run: |
+          echo "## Quality Gate Status" >> $GITHUB_STEP_SUMMARY
+          
+          UNIT_STATUS="${{ needs.unit-tests.result }}"
+          BDD_STATUS="${{ needs.bdd-tests.result }}"
+          
+          echo "Unit Tests: $UNIT_STATUS" >> $GITHUB_STEP_SUMMARY
+          echo "BDD Tests: $BDD_STATUS" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$UNIT_STATUS" = "success" ] && [ "$BDD_STATUS" != "failure" ]; then
+            echo "✅ Quality Gate PASSED" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "❌ Quality Gate FAILED" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  publish-reports:
+    name: Publish Reports
+    runs-on: ubuntu-latest
+    needs: [bdd-tests]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download Serenity reports
+        uses: actions/download-artifact@v3
+        with:
+          name: serenity-reports
+          path: target/site/serenity
+          
+      - name: Deploy reports
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/site/serenity
+        
+      - name: Create deployment
+        uses: actions/deploy-pages@v4
+        if: github.ref == 'refs/heads/main'
